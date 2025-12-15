@@ -19,6 +19,10 @@
 | `TG_BOT_TOKEN` | Telegram Bot Token |
 | `TG_CHAT_ID` | Telegram Chat ID |
 | `REPO_TOKEN` | GitHub Token（用于自动更新 Secret） |
+| `DINGTALK_ACCESS_TOKEN` | 钉钉机器人的访问令牌 |
+| `DINGTALK_SECRET` | 钉钉机器人的加签密钥 |
+
+
 
 ## 流程图
 ```
