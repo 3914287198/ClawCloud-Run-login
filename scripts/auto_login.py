@@ -3,7 +3,7 @@
 ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
-- Telegram 通知
+- 钉钉通知
 """
 
 import os
@@ -11,6 +11,11 @@ import sys
 import time
 import base64
 import requests
+import hmac
+import hashlib
+import urllib.parse
+import json
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # ==================== 配置 ====================
@@ -18,40 +23,55 @@ CLAW_CLOUD_URL = "https://eu-central-1.run.claw.cloud"
 SIGNIN_URL = f"{CLAW_CLOUD_URL}/signin"
 DEVICE_VERIFY_WAIT = 30
 
+# 钉钉配置
+DINGTALK_ACCESS_TOKEN = os.environ.get('DINGTALK_ACCESS_TOKEN', 'ada335c55c006ddc351eaad285a0d1d6d45e8e0a7a917170909edba0405eb34e')
+DINGTALK_SECRET = os.environ.get('DINGTALK_SECRET', 'SECe15f72fe6b681f05e537fc413fdb42e6f5da3571cdf4bca3c79c3a4e841398e4')
 
-class Telegram:
-    """Telegram 通知"""
+
+class DingTalk:
+    """钉钉通知"""
     
     def __init__(self):
-        self.token = os.environ.get('TG_BOT_TOKEN')
-        self.chat_id = os.environ.get('TG_CHAT_ID')
-        self.ok = bool(self.token and self.chat_id)
+        self.access_token = DINGTALK_ACCESS_TOKEN
+        self.secret = DINGTALK_SECRET
+        self.ok = bool(self.access_token and self.secret)
+    
+    def generate_sign(self, timestamp):
+        """生成签名"""
+        string_to_sign = f'{timestamp}\n{self.secret}'
+        hmac_code = hmac.new(self.secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+        return sign
     
     def send(self, msg):
         if not self.ok:
             return
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
-                timeout=30
-            )
-        except:
-            pass
-    
-    def photo(self, path, caption=""):
-        if not self.ok or not os.path.exists(path):
-            return
-        try:
-            with open(path, 'rb') as f:
-                requests.post(
-                    f"https://api.telegram.org/bot{self.token}/sendPhoto",
-                    data={"chat_id": self.chat_id, "caption": caption[:1024]},
-                    files={"photo": f},
-                    timeout=60
-                )
-        except:
-            pass
+            timestamp = int(round(time.time() * 1000))
+            sign = self.generate_sign(timestamp)
+            
+            url = f'https://oapi.dingtalk.com/robot/send?access_token={self.access_token}&timestamp={timestamp}&sign={sign}'
+            
+            headers = {'Content-Type': 'application/json'}
+            
+            data = {
+                "msgtype": "text",
+                "text": {
+                    "content": msg
+                }
+            }
+            
+            response = requests.post(url, headers=headers, data=json.dumps(data), timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    print("钉钉消息发送成功")
+                else:
+                    print(f"钉钉消息发送失败: {result.get('errmsg')}")
+            else:
+                print(f"钉钉消息发送失败: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"钉钉消息发送异常: {e}")
 
 
 class SecretUpdater:
@@ -109,7 +129,7 @@ class AutoLogin:
         self.username = os.environ.get('GH_USERNAME')
         self.password = os.environ.get('GH_PASSWORD')
         self.gh_session = os.environ.get('GH_SESSION', '').strip()
-        self.tg = Telegram()
+        self.dingtalk = DingTalk()
         self.secret = SecretUpdater()
         self.shots = []
         self.logs = []
@@ -163,28 +183,28 @@ class AutoLogin:
         # 自动更新 Secret
         if self.secret.update('GH_SESSION', value):
             self.log("已自动更新 GH_SESSION", "SUCCESS")
-            self.tg.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
+            self.dingtalk.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
         else:
-            # 通过 Telegram 发送
-            self.tg.send(f"""🔑 <b>新 Cookie</b>
+            # 通过钉钉发送
+            self.dingtalk.send(f"""🔑 <b>新 Cookie</b>
 
 请更新 Secret <b>GH_SESSION</b>:
 <code>{value}</code>""")
-            self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
+            self.log("已通过钉钉发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
         """等待设备验证"""
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
         self.shot(page, "设备验证")
         
-        self.tg.send(f"""⚠️ <b>需要设备验证</b>
+        self.dingtalk.send(f"""⚠️ <b>需要设备验证</b>
 
 请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准""")
         
         if self.shots:
-            self.tg.photo(self.shots[-1], "设备验证页面")
+            self.dingtalk.send(f"设备验证页面截图: {self.shots[-1]}")
         
         for i in range(DEVICE_VERIFY_WAIT):
             time.sleep(1)
@@ -193,7 +213,7 @@ class AutoLogin:
                 url = page.url
                 if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
-                    self.tg.send("✅ <b>设备验证通过</b>")
+                    self.dingtalk.send("✅ <b>设备验证通过</b>")
                     return True
                 try:
                     page.reload(timeout=10000)
@@ -205,7 +225,7 @@ class AutoLogin:
             return True
         
         self.log("设备验证超时", "ERROR")
-        self.tg.send("❌ <b>设备验证超时</b>")
+        self.dingtalk.send("❌ <b>设备验证超时</b>")
         return False
     
     def login_github(self, page, context):
@@ -246,7 +266,7 @@ class AutoLogin:
         # 2FA
         if 'two-factor' in page.url:
             self.log("需要两步验证！", "ERROR")
-            self.tg.send("❌ <b>需要两步验证</b>")
+            self.dingtalk.send("❌ <b>需要两步验证</b>")
             return False
         
         # 错误
@@ -299,28 +319,28 @@ class AutoLogin:
         self.shot(page, "完成")
     
     def notify(self, ok, err=""):
-        if not self.tg.ok:
+        if not self.dingtalk.ok:
             return
         
         msg = f"""<b>🤖 ClawCloud 自动登录</b>
 
 <b>状态:</b> {"✅ 成功" if ok else "❌ 失败"}
 <b>用户:</b> {self.username}
-<b>时间:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}"""
+<b>时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
         
         if err:
             msg += f"\n<b>错误:</b> {err}"
         
         msg += "\n\n<b>日志:</b>\n" + "\n".join(self.logs[-6:])
         
-        self.tg.send(msg)
+        self.dingtalk.send(msg)
         
         if self.shots:
             if not ok:
                 for s in self.shots[-3:]:
-                    self.tg.photo(s, s)
+                    self.dingtalk.send(f"截图: {s}")
             else:
-                self.tg.photo(self.shots[-1], "完成")
+                self.dingtalk.send(f"完成截图: {self.shots[-1]}")
     
     def run(self):
         print("\n" + "="*50)
