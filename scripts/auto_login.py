@@ -3,7 +3,7 @@
 ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
-- 钉钉通知
+- 钉钉通知（包含验证页面URL）
 """
 
 import os
@@ -193,15 +193,23 @@ class AutoLogin:
             self.log("已通过钉钉发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
-        """等待设备验证"""
+        """等待设备验证（新增URL发送）"""
+        # 获取当前验证页面的URL
+        verify_url = page.url
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
+        self.log(f"验证页面URL: {verify_url}", "WARN")
         self.shot(page, "设备验证")
         
+        # 钉钉通知中包含URL
         self.dingtalk.send(f"""⚠️ <b>需要设备验证</b>
 
-请在 {DEVICE_VERIFY_WAIT} 秒内批准：
-1️⃣ 检查邮箱点击链接
-2️⃣ 或在 GitHub App 批准""")
+请在 {DEVICE_VERIFY_WAIT} 秒内点击下方链接完成批准：
+🔗 验证链接: {verify_url}
+
+操作步骤：
+1️⃣ 点击上方链接打开验证页面
+2️⃣ 检查邮箱点击验证链接 或 在 GitHub App 批准
+3️⃣ 完成后脚本会自动继续执行""")
         
         if self.shots:
             self.dingtalk.send(f"设备验证页面截图: {self.shots[-1]}")
@@ -213,7 +221,7 @@ class AutoLogin:
                 url = page.url
                 if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
-                    self.dingtalk.send("✅ <b>设备验证通过</b>")
+                    self.dingtalk.send("✅ <b>设备验证通过</b>，脚本继续执行")
                     return True
                 try:
                     page.reload(timeout=10000)
@@ -225,7 +233,7 @@ class AutoLogin:
             return True
         
         self.log("设备验证超时", "ERROR")
-        self.dingtalk.send("❌ <b>设备验证超时</b>")
+        self.dingtalk.send(f"❌ <b>设备验证超时</b>（{DEVICE_VERIFY_WAIT}秒）\n请检查验证链接：{verify_url}")
         return False
     
     def login_github(self, page, context):
@@ -412,7 +420,7 @@ class AutoLogin:
                 url = page.url
                 self.log(f"当前: {url}")
                 
-                # 3. GitHub 登录
+                # 3. GitHub 认证
                 self.log("步骤3: GitHub 认证", "STEP")
                 
                 if 'github.com/login' in url or 'github.com/session' in url:
