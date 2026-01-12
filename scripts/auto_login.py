@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 GitHub 账号 ClawCloud 保活脚本
-- 极简方案，专注保活，避免复杂交互
-- 自动刷新会话，防止账号失效
-- 仅推送关键验证链接到钉钉
+- 修复设备验证链接问题（推送真正的操作链接）
+- 极简保活逻辑，专注维持会话
 """
 
 import os
@@ -15,12 +14,9 @@ from playwright.sync_api import sync_playwright
 from datetime import datetime
 
 # ==================== 核心配置 ====================
-# 基础配置
 CLAW_CLOUD_URL = "https://eu-central-1.run.claw.cloud"
-GITHUB_LOGIN_URL = "https://github.com/login"
-# 保活等待时间（秒）
-VERIFY_WAIT_TIME = 60
-# 钉钉配置（仅推送验证链接）
+VERIFY_WAIT_TIME = 120  # 延长验证等待时间到120秒
+# 钉钉配置
 DINGTALK_ACCESS_TOKEN = 'ada335c55c006ddc351eaad285a0d1d6d45e8e0a7a917170909edba0405eb34e'
 DINGTALK_SECRET = 'SECe15f72fe6b681f05e537fc413fdb42e6f5da3571cdf4bca3c79c3a4e841398e4'
 
@@ -31,7 +27,6 @@ GH_SESSION = os.environ.get('GH_SESSION', '')
 
 # 全局状态
 global_context = None
-dingtalk_ok = False
 
 
 # ==================== 工具函数 ====================
@@ -44,8 +39,8 @@ def print_flush(msg, level="INFO"):
     return log_line
 
 
-def send_dingtalk_link(link):
-    """仅推送纯链接到钉钉"""
+def send_dingtalk_link(link, msg_type="verify"):
+    """推送验证链接到钉钉（区分类型）"""
     try:
         import hmac
         import hashlib
@@ -61,19 +56,65 @@ def send_dingtalk_link(link):
         
         url = f'https://oapi.dingtalk.com/robot/send?access_token={DINGTALK_ACCESS_TOKEN}&timestamp={timestamp}&sign={sign}'
         headers = {'Content-Type': 'application/json;charset=utf-8'}
+        
+        if msg_type == "verify":
+            # 验证提示（说明操作方式）
+            content = f"""⚠️ GitHub 设备验证需要你手动完成
+操作方式（二选一）：
+1. 检查 GitHub 绑定邮箱，点击邮件中的验证链接
+2. 打开 GitHub App 批准设备登录
+⚠️ 注意：下方链接是状态页，无法直接验证！
+状态页：{link}
+⏰ 请在 {VERIFY_WAIT_TIME} 秒内完成验证"""
+        else:
+            content = link
+        
         data = {
             "msgtype": "text",
-            "text": {"content": link},
+            "text": {"content": content},
             "at": {"isAtAll": False}
         }
         
         resp = requests.post(url, headers=headers, json=data, timeout=10)
         if resp.status_code == 200 and resp.json().get('errcode') == 0:
-            print_flush("钉钉链接推送成功", "SUCCESS")
+            print_flush("钉钉验证提示推送成功", "SUCCESS")
         else:
             print_flush(f"钉钉推送失败: {resp.text}", "ERROR")
     except Exception as e:
         print_flush(f"钉钉推送异常: {str(e)}", "ERROR")
+
+
+def extract_verify_link(page):
+    """从 verified-device 页面提取实际的验证操作链接"""
+    try:
+        # 等待页面内容加载
+        page.wait_for_load_state('domcontentloaded', timeout=10000)
+        time.sleep(2)
+        
+        # 方式1：查找页面中的验证链接
+        verify_links = page.locator('a[href*="github.com/login/device/code"]').all()
+        if verify_links:
+            real_link = verify_links[0].get_attribute('href')
+            if real_link:
+                if not real_link.startswith('https'):
+                    real_link = f"https://github.com{real_link}"
+                return real_link
+        
+        # 方式2：查找所有可点击的验证相关链接
+        all_links = page.locator('a').all()
+        for link in all_links:
+            href = link.get_attribute('href')
+            text = link.inner_text().lower()
+            if href and any(key in href for key in ['verify', 'device', 'code']) and 'github.com' in href:
+                if not href.startswith('https'):
+                    href = f"https://github.com{href}"
+                return href
+        
+        # 方式3：返回状态页并提示正确操作方式
+        return page.url
+    except Exception as e:
+        print_flush(f"提取验证链接失败: {str(e)}", "WARN")
+        return page.url
 
 
 def update_github_secret(new_session):
@@ -131,8 +172,7 @@ def init_browser_context():
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
                 '--disable-web-security',
-                '--ignore-certificate-errors',
-                '--disable-extensions'
+                '--ignore-certificate-errors'
             ]
         )
         
@@ -145,11 +185,7 @@ def init_browser_context():
             extra_http_headers={
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://github.com/',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Upgrade-Insecure-Requests': '1'
+                'Referer': 'https://github.com/'
             }
         )
         
@@ -157,7 +193,6 @@ def init_browser_context():
         global_context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
         
         print_flush("浏览器上下文初始化成功", "SUCCESS")
@@ -189,7 +224,7 @@ def load_github_cookies(page):
 
 
 def github_login(page):
-    """极简 GitHub 登录流程，仅处理核心步骤"""
+    """修复设备验证流程的 GitHub 登录"""
     try:
         # 等待登录页面加载
         page.wait_for_selector('input#login_field', timeout=10000)
@@ -206,46 +241,65 @@ def github_login(page):
         
         # 处理设备验证
         if 'verified-device' in current_url or 'device-verification' in current_url:
-            print_flush("触发设备验证，推送链接到钉钉", "WARN")
-            send_dingtalk_link(current_url)
+            print_flush("触发 GitHub 设备验证", "WARN")
             
-            # 等待验证（延长时间）
+            # 提取真正的验证链接（如果有）
+            real_verify_link = extract_verify_link(page)
+            
+            # 推送验证提示到钉钉（说明正确操作方式）
+            send_dingtalk_link(real_verify_link)
+            
+            # 优化的验证等待逻辑：主动刷新页面检查状态
+            verify_success = False
             for i in range(VERIFY_WAIT_TIME):
                 time.sleep(1)
+                
+                # 每5秒刷新一次页面，检查验证状态
+                if i % 5 == 0:
+                    print_flush(f"等待验证... ({i}/{VERIFY_WAIT_TIME}秒)", "INFO")
+                    try:
+                        page.reload(timeout=10000)
+                        page.wait_for_load_state('networkidle', timeout=5000)
+                    except:
+                        pass
+                
+                # 检查是否验证通过
                 new_url = page.url
                 if 'verified-device' not in new_url and 'device-verification' not in new_url:
                     print_flush("设备验证通过，继续流程", "SUCCESS")
+                    verify_success = True
                     break
-                if i % 10 == 0:
-                    print_flush(f"等待验证... ({i}/{VERIFY_WAIT_TIME}秒)")
-            else:
+            
+            if not verify_success:
                 print_flush("设备验证超时", "ERROR")
                 return False
         
         # 检查登录状态
-        if 'github.com/settings/profile' in page.url or 'github.com/dashboard' in page.url:
+        if any(path in page.url for path in ['github.com/settings/profile', 'github.com/dashboard', 'github.com/']):
             print_flush("GitHub 登录成功", "SUCCESS")
+            
+            # 提取新的 Session Cookie
+            new_session = None
+            for cookie in global_context.cookies():
+                if cookie['name'] == 'user_session' and '.github.com' in cookie['domain']:
+                    new_session = cookie['value']
+                    break
+            
+            if new_session and new_session != GH_SESSION:
+                print_flush(f"获取到新 Session: {new_session[:10]}...", "SUCCESS")
+                update_github_secret(new_session)
+            
             return True
         
-        # 提取新的 Session Cookie
-        new_session = None
-        for cookie in global_context.cookies():
-            if cookie['name'] == 'user_session' and '.github.com' in cookie['domain']:
-                new_session = cookie['value']
-                break
-        
-        if new_session and new_session != GH_SESSION:
-            print_flush(f"获取到新 Session: {new_session[:10]}...", "SUCCESS")
-            update_github_secret(new_session)
-        
-        return True
+        print_flush("GitHub 登录状态验证失败", "ERROR")
+        return False
     except Exception as e:
         print_flush(f"GitHub 登录失败: {str(e)}", "ERROR")
         return False
 
 
 def clawcloud_keepalive():
-    """核心保活逻辑：访问 ClawCloud 并维持会话"""
+    """核心保活逻辑"""
     browser, context = init_browser_context()
     page = context.new_page()
     
