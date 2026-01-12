@@ -3,7 +3,7 @@
 ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
-- 钉钉通知（包含验证页面URL）
+- 钉钉实时通知（每步执行立即推送）
 """
 
 import os
@@ -29,12 +29,16 @@ DINGTALK_SECRET = os.environ.get('DINGTALK_SECRET')
 
 
 class DingTalk:
-    """钉钉通知"""
+    """钉钉通知（支持实时推送）"""
     
     def __init__(self):
         self.access_token = DINGTALK_ACCESS_TOKEN
         self.secret = DINGTALK_SECRET
         self.ok = bool(self.access_token and self.secret)
+        if self.ok:
+            print("✅ 钉钉通知已启用")
+        else:
+            print("⚠️ 钉钉通知未启用（需要 DINGTALK_ACCESS_TOKEN 和 DINGTALK_SECRET）")
     
     def generate_sign(self, timestamp):
         """生成签名"""
@@ -43,35 +47,63 @@ class DingTalk:
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
         return sign
     
-    def send(self, msg):
+    def send(self, msg, is_real_time=True):
+        """
+        发送钉钉消息
+        :param msg: 消息内容
+        :param is_real_time: 是否是实时日志（用于区分汇总通知）
+        """
         if not self.ok:
             return
+        
+        # 实时日志添加前缀标识
+        if is_real_time:
+            msg = f"🔍 【实时日志】\n{msg}"
+        
         try:
             timestamp = int(round(time.time() * 1000))
             sign = self.generate_sign(timestamp)
             
             url = f'https://oapi.dingtalk.com/robot/send?access_token={self.access_token}&timestamp={timestamp}&sign={sign}'
             
-            headers = {'Content-Type': 'application/json'}
+            headers = {'Content-Type': 'application/json;charset=utf-8'}
             
             data = {
                 "msgtype": "text",
                 "text": {
                     "content": msg
+                },
+                "at": {
+                    "isAtAll": False  # 不@所有人
                 }
             }
             
-            response = requests.post(url, headers=headers, data=json.dumps(data), timeout=30)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('errcode') == 0:
-                    print("钉钉消息发送成功")
-                else:
-                    print(f"钉钉消息发送失败: {result.get('errmsg')}")
-            else:
-                print(f"钉钉消息发送失败: HTTP {response.status_code}")
+            # 发送请求（增加超时重试）
+            for retry in range(2):
+                try:
+                    response = requests.post(
+                        url, 
+                        headers=headers, 
+                        data=json.dumps(data, ensure_ascii=False), 
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get('errcode') == 0:
+                            print(f"✅ 钉钉消息发送成功")
+                        else:
+                            print(f"❌ 钉钉消息发送失败: {result.get('errmsg')}")
+                    else:
+                        print(f"❌ 钉钉消息发送失败: HTTP {response.status_code}")
+                    break
+                except requests.exceptions.Timeout:
+                    if retry == 0:
+                        print("⚠️ 钉钉消息发送超时，重试中...")
+                        time.sleep(1)
+                    else:
+                        print("❌ 钉钉消息发送超时，重试失败")
         except Exception as e:
-            print(f"钉钉消息发送异常: {e}")
+            print(f"❌ 钉钉消息发送异常: {e}")
 
 
 class SecretUpdater:
@@ -135,11 +167,29 @@ class AutoLogin:
         self.logs = []
         self.n = 0
         
-    def log(self, msg, level="INFO"):
+    def log(self, msg, level="INFO", push_dingtalk=True):
+        """
+        日志记录（支持实时推送到钉钉）
+        :param msg: 日志内容
+        :param level: 日志级别
+        :param push_dingtalk: 是否推送到钉钉
+        """
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
-        line = f"{icons.get(level, '•')} {msg}"
+        icon = icons.get(level, '•')
+        line = f"{icon} {msg}"
+        
+        # 打印到控制台
         print(line)
         self.logs.append(line)
+        
+        # 实时推送到钉钉（关键步骤才推送）
+        if push_dingtalk and self.dingtalk.ok:
+            # 过滤掉重复/无用的日志，只推送关键信息
+            if any(keyword in msg for keyword in [
+                "步骤", "需要设备验证", "验证页面URL", "设备验证通过", 
+                "设备验证超时", "当前:", "已点击", "登录失败", "重定向"
+            ]):
+                self.dingtalk.send(line)
     
     def shot(self, page, name):
         self.n += 1
@@ -183,57 +233,51 @@ class AutoLogin:
         # 自动更新 Secret
         if self.secret.update('GH_SESSION', value):
             self.log("已自动更新 GH_SESSION", "SUCCESS")
-            self.dingtalk.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存")
+            self.dingtalk.send("🔑 <b>Cookie 已自动更新</b>\n\nGH_SESSION 已保存", is_real_time=False)
         else:
             # 通过钉钉发送
             self.dingtalk.send(f"""🔑 <b>新 Cookie</b>
 
 请更新 Secret <b>GH_SESSION</b>:
-<code>{value}</code>""")
+<code>{value}</code>""", is_real_time=False)
             self.log("已通过钉钉发送 Cookie", "SUCCESS")
     
     def wait_device(self, page):
-        """等待设备验证（新增URL发送）"""
+        """等待设备验证（优化版）"""
         # 获取当前验证页面的URL
         verify_url = page.url
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
-        self.log(f"验证页面URL: {verify_url}", "WARN")
+        self.log(f"验证页面URL: {verify_url}", "WARN")  # 这行会实时推送到钉钉
         self.shot(page, "设备验证")
         
-        # 钉钉通知中包含URL
-        self.dingtalk.send(f"""⚠️ <b>需要设备验证</b>
-
-请在 {DEVICE_VERIFY_WAIT} 秒内点击下方链接完成批准：
-🔗 验证链接: {verify_url}
-
-操作步骤：
-1️⃣ 点击上方链接打开验证页面
-2️⃣ 检查邮箱点击验证链接 或 在 GitHub App 批准
-3️⃣ 完成后脚本会自动继续执行""")
+        # 单独发送详细的验证通知（确保URL能收到）
+        verify_msg = f"""⚠️ 【设备验证提醒】
+请在 {DEVICE_VERIFY_WAIT} 秒内完成以下操作：
+1️⃣ 点击链接打开验证页面：{verify_url}
+2️⃣ 检查邮箱/GitHub App 完成设备批准
+3️⃣ 完成后脚本会自动继续执行"""
+        self.dingtalk.send(verify_msg, is_real_time=False)
         
         if self.shots:
-            self.dingtalk.send(f"设备验证页面截图: {self.shots[-1]}")
+            self.dingtalk.send(f"📸 设备验证页面截图: {self.shots[-1]}", is_real_time=False)
         
+        # 优化等待逻辑：减少重载频率，避免干扰验证
         for i in range(DEVICE_VERIFY_WAIT):
             time.sleep(1)
             if i % 5 == 0:
-                self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
+                self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)", push_dingtalk=False)
                 url = page.url
                 if 'verified-device' not in url and 'device-verification' not in url:
                     self.log("设备验证通过！", "SUCCESS")
-                    self.dingtalk.send("✅ <b>设备验证通过</b>，脚本继续执行")
+                    self.dingtalk.send("✅ 设备验证通过，脚本继续执行", is_real_time=False)
                     return True
-                try:
-                    page.reload(timeout=10000)
-                    page.wait_for_load_state('networkidle', timeout=10000)
-                except:
-                    pass
         
+        # 最终检查
         if 'verified-device' not in page.url:
             return True
         
         self.log("设备验证超时", "ERROR")
-        self.dingtalk.send(f"❌ <b>设备验证超时</b>（{DEVICE_VERIFY_WAIT}秒）\n请检查验证链接：{verify_url}")
+        self.dingtalk.send(f"❌ 设备验证超时（{DEVICE_VERIFY_WAIT}秒）\n最后验证链接：{verify_url}", is_real_time=False)
         return False
     
     def login_github(self, page, context):
@@ -244,7 +288,7 @@ class AutoLogin:
         try:
             page.locator('input[name="login"]').fill(self.username)
             page.locator('input[name="password"]').fill(self.password)
-            self.log("已输入凭据")
+            self.log("已输入凭据", push_dingtalk=False)
         except Exception as e:
             self.log(f"输入失败: {e}", "ERROR")
             return False
@@ -261,7 +305,7 @@ class AutoLogin:
         self.shot(page, "github_登录后")
         
         url = page.url
-        self.log(f"当前: {url}")
+        self.log(f"当前: {url}", "INFO")  # 这行会实时推送到钉钉
         
         # 设备验证
         if 'verified-device' in url or 'device-verification' in url:
@@ -274,14 +318,16 @@ class AutoLogin:
         # 2FA
         if 'two-factor' in page.url:
             self.log("需要两步验证！", "ERROR")
-            self.dingtalk.send("❌ <b>需要两步验证</b>")
+            self.dingtalk.send("❌ <b>需要两步验证</b>", is_real_time=False)
             return False
         
         # 错误
         try:
             err = page.locator('.flash-error').first
             if err.is_visible(timeout=2000):
-                self.log(f"错误: {err.inner_text()}", "ERROR")
+                err_msg = err.inner_text()
+                self.log(f"错误: {err_msg}", "ERROR")
+                self.dingtalk.send(f"❌ GitHub登录错误: {err_msg}", is_real_time=False)
                 return False
         except:
             pass
@@ -290,7 +336,7 @@ class AutoLogin:
     
     def oauth(self, page):
         """处理 OAuth"""
-        if 'github.com/login/oauth/authorize' in page.url:
+        if 'github.com/login/oauth/authorize' in url:
             self.log("处理 OAuth...", "STEP")
             self.shot(page, "oauth")
             self.click(page, ['button[name="authorize"]', 'button:has-text("Authorize")'], "授权")
@@ -309,7 +355,7 @@ class AutoLogin:
                 self.oauth(page)
             time.sleep(1)
             if i % 10 == 0:
-                self.log(f"  等待... ({i}秒)")
+                self.log(f"  等待... ({i}秒)", "INFO", push_dingtalk=False)
         self.log("重定向超时", "ERROR")
         return False
     
@@ -327,10 +373,11 @@ class AutoLogin:
         self.shot(page, "完成")
     
     def notify(self, ok, err=""):
+        """最终汇总通知"""
         if not self.dingtalk.ok:
             return
         
-        msg = f"""<b>🤖 ClawCloud 自动登录</b>
+        msg = f"""<b>🤖 ClawCloud 自动登录 - 最终结果</b>
 
 <b>状态:</b> {"✅ 成功" if ok else "❌ 失败"}
 <b>用户:</b> {self.username}
@@ -339,25 +386,25 @@ class AutoLogin:
         if err:
             msg += f"\n<b>错误:</b> {err}"
         
-        msg += "\n\n<b>日志:</b>\n" + "\n".join(self.logs[-6:])
+        msg += "\n\n<b>关键日志:</b>\n" + "\n".join(self.logs[-10:])
         
-        self.dingtalk.send(msg)
+        self.dingtalk.send(msg, is_real_time=False)
         
-        if self.shots:
-            if not ok:
-                for s in self.shots[-3:]:
-                    self.dingtalk.send(f"截图: {s}")
-            else:
-                self.dingtalk.send(f"完成截图: {self.shots[-1]}")
+        if self.shots and not ok:
+            for s in self.shots[-3:]:
+                self.dingtalk.send(f"📸 错误截图: {s}", is_real_time=False)
     
     def run(self):
         print("\n" + "="*50)
         print("🚀 ClawCloud 自动登录")
         print("="*50 + "\n")
         
-        self.log(f"用户名: {self.username}")
-        self.log(f"Session: {'有' if self.gh_session else '无'}")
-        self.log(f"密码: {'有' if self.password else '无'}")
+        # 初始化通知
+        self.dingtalk.send("🚀 ClawCloud 自动登录脚本开始执行", is_real_time=False)
+        
+        self.log(f"用户名: {self.username}", push_dingtalk=False)
+        self.log(f"Session: {'有' if self.gh_session else '无'}", push_dingtalk=False)
+        self.log(f"密码: {'有' if self.password else '无'}", push_dingtalk=False)
         
         if not self.username or not self.password:
             self.log("缺少凭据", "ERROR")
@@ -368,7 +415,7 @@ class AutoLogin:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             )
             page = context.new_page()
             
@@ -418,7 +465,7 @@ class AutoLogin:
                 self.shot(page, "点击后")
                 
                 url = page.url
-                self.log(f"当前: {url}")
+                self.log(f"当前: {url}", "INFO")  # 实时推送跳转后的URL
                 
                 # 3. GitHub 认证
                 self.log("步骤3: GitHub 认证", "STEP")
@@ -464,11 +511,12 @@ class AutoLogin:
                 print("="*50 + "\n")
                 
             except Exception as e:
-                self.log(f"异常: {e}", "ERROR")
+                error_msg = f"异常: {e}"
+                self.log(error_msg, "ERROR")
                 self.shot(page, "异常")
                 import traceback
                 traceback.print_exc()
-                self.notify(False, str(e))
+                self.notify(False, error_msg)
                 sys.exit(1)
             finally:
                 browser.close()
