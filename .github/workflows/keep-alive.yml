@@ -2,7 +2,7 @@ name: ClawCloud 自动登录保活
 
 on:
   schedule:
-    - cron: '0 6 */5 * *'
+    - cron: '0 7 */5 * *'  # UTC 7:00，每5天运行
   workflow_dispatch:
 
 jobs:
@@ -33,5 +33,5 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          
         run: python scripts/auto_login.py
